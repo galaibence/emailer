@@ -54,8 +54,9 @@ with the request body confirming to the following schema
     "additionalProperties": false
 }
 ```
+The API is going to be implemented with Fastify, which has a built-in JSON schema verification method for incoming request bodies.
 
-The API responds with `202 Accepted` status code when the message was successfully submitted to one the queues.
+The API responds with `202 Accepted` status code when the message was successfully submitted to one the queues. `500 Internal Server Error` is returned for unexpected errors, and `4xx` for incorrect API keys or invalid message bodies. The API does not return any data. 
 
 The API is protected by API keys. The API keys are used to identify the caller. The caller's ID is then added to every message, and forwarded to the queues of the desired SLAs.
 
@@ -69,7 +70,7 @@ The API definition as well as the provisioned infrastructure is going to be impl
 
 ### Queues
 
-To not let any messages be lost, the queues need to be highly available and scalable. To achieve this, we are going to use an active-active failover, with the messages kept on persistent storage, so upon a failure to the active queueing service, the system can fail over to the other, already warm service, so no downtime is expected, and with the messages persisted, there won't be any delays due to synchronising the messages across the two instances.
+To not let any messages be lost, the queues need to be highly available and scalable. To achieve this, we are going to use an active-active failover with a load balancer, and the messages kept on persistent storage. By persisting messages to shared data store, there are no risks of failing to replicate messages over network if the instance is down but the messages not yet synchronised. With an active-active failover with load balancing, the load balancer can check the healtiness of the instances and route the requests to the live instance. 
 
 All the configuration for the queues are to be kept in version controlled config files. These configuration files are shared across the consumer, the API and the queue cluster, so all are aware of the location of the queues and the SLAs they represent.
 
@@ -77,12 +78,12 @@ All the configuration for the queues are to be kept in version controlled config
 
 The queue consumer service polls the queues, populates the templated emails with the payload of the messages and submits them to the SMPT cluster with respect to the SMTP cluster's limitations.
 
-The queue consumer service stores the email templates on an object store (we are planning to use AWS S3), based on the IDs of the service's consumers (determined by the API keys used, as described in the API section above). To store the bucket and key prefix information, we can use environment variables, stored in configuration in code.
+The queue consumer service stores the email templates on an object store (we are planning to use AWS S3), based on the IDs of the service's consumers (determined by the API keys used, as described in the API section above). To store the bucket and key prefix information, we can use environment variables, stored as configuration in code.
 
 To achieve idempotency (not delivering the same email multiple times) we are calculating the md5 hash of the emails, and store the hashes in a memory store (Redis). The steps taken for every received message is described below:
 1. The message is received by the consumer
 2. The ID of the service that sent the message is read from the message
-3. The email template is pulled from the object store based on the ID
+3. The email template is pulled from the object store based on the ID (this can be cached if needed)
 4. The email body is created using the message payload and the template
 5. The md5 hash of the email is calculated
 6. The queue consumer checks the hash in the Redis store. If it is already there, continue with step 9
@@ -90,11 +91,11 @@ To achieve idempotency (not delivering the same email multiple times) we are cal
 8. Store the hash in Redis with a time-to-live set to the SLA of the queue the message was pulled from
 9. Deletes the message from the queue it was pulled from
 
-The provisioning of infrastructure and configuration are stored in version control, using cdk8s as the infrastructure-as-code tool. 
+The provisioning of infrastructure and configuration are stored in version control, using cdk8s as the infrastructure-as-code tool.
 
-Even though we are aiming for not sending a message multiple times to the customers, if for any reason this happens it is not as big a problem then not sending it at all. Although this means the Redis instance(s) do not need the same availability as the queueing system, we would still deploy Redis across multiple instances with persistent storage set up for them, so in case an instance fails, the cache is still available and the system reachable via other instances. 
+Even though we are aiming for not sending a message multiple times to the customers, if for any reason this happens it is not as big a problem as not sending it at all. Although this means the Redis instance(s) do not need the same availability as the queueing system, we would still deploy Redis across multiple instances with persistent storage set up for them, so in case an instance fails, the cache is still available and the system reachable via other instances. 
 
-We need to right-size the queue consumer so it can process the same amount of messages that the SMPT cluster can. To achieve this, we start with a small instance (to save costs) and gradually increase it in size (vertical scaling). The service need to implement a liveliness signal, so Kuberentes can check if its operational, and if the queue consumer serice fails, we need to fail over to another instance. We need to measure how long it takes to boot a new instance, and if the cold start time is not acceptable, we might need to keep another instance warm and fail over to that when the first instance fails. This, however depends on the supported SLAs. 
+We need to right-size the queue consumer so it can process the same amount of messages that the SMPT cluster can. To achieve this, we start with a small instance (to save costs) and gradually increase it in size (vertical scaling). The service needs to implement a liveliness signal, so Kuberentes can check if its operational, and if the queue consumer service fails, we boot up a new one. We need to measure how long it takes to boot a new instance, and if the cold start time is not acceptable, we might need to keep another instance warm and fail over to that when the first instance fails. This, however depends on the supported SLAs. 
 
 The algorithm to poll the messages from the queues are the following. Working with the above example, we first poll the queue for 500 messages every second from the highest SLA levels (1 minute SLA), and then use up the remaining 500 message availability to serve the next queue. In case of a burst of messages from the Marketing Service, we allocate the remainder 500 messages to that. Within an hour, we can serve 1,800,000 messages when consuming 500/second, so this will be able to fulfill the requirements on those two, and the 24h and 72h SLAs will still be respected, as off-peak hours we have capacity to go through the remaining queues.
 
